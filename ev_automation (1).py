@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 EV Automation with cost-based AI planning (Fast Downward) + Firebase logging
 """
@@ -152,7 +151,7 @@ def temp_state(temp):
         return "temp_critical"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PDDL generation
+# PDDL generation - UPDATED FOR NEW DOMAIN.PDDL
 # ──────────────────────────────────────────────────────────────────────────────
 PROBLEM_FILE = Path("problem.pddl")
 
@@ -162,12 +161,25 @@ def write_problem(batt_st, temp_st, charging):
                 "  (:domain ev_charging)\n"
                 "  (:init\n"
                 "    (= (total-cost) 0)\n")
-        f.write(f"    ({batt_st})\n")
-        f.write(f"    ({temp_st})\n")
+        
+        # Add all battery states (explicitly setting one true and others false)
+        battery_states = ["battery_extremely_low", "battery_low", 
+                         "battery_medium", "battery_high", "battery_full"]
+        for state in battery_states:
+            f.write(f"    ({state})" if state == batt_st else f"    (not ({state}))")
+            f.write("\n")
+        
+        # Add temperature state
+        f.write(f"    ({'temperature_high' if temp_st == 'temp_high' else 'not (temperature_high)'})\n")
+        
+        # Add charging status
         if charging:
             f.write("    (charging)\n")
+        
+        # Initial device states
         f.write("    (motor_off)\n    (infotainment_off)\n    (ac_off)\n  )\n")
 
+        # Goal conditions based on battery state (UPDATED)
         goals = {
             "battery_extremely_low": "(and (motor_off) (infotainment_off) (ac_off))",
             "battery_low": "(and (motor_low) (infotainment_on) (ac_off))",
@@ -182,7 +194,7 @@ def write_problem(batt_st, temp_st, charging):
         f.write("  (:metric minimize (total-cost))\n)\n")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Planning & Action Application
+# Planning & Action Application (UNCHANGED)
 # ──────────────────────────────────────────────────────────────────────────────
 def run_planner():
     cmd = [
@@ -235,7 +247,7 @@ def apply_actions(plan):
     print(f"[ACTION] Motor={state_vars['motor']}({duty}%), AC={state_vars['ac']}, Infotainment={state_vars['info']}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main Loop
+# Main Loop (UNCHANGED)
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
     print("=== EV automation with AI planning + Firebase logging ===")
@@ -255,7 +267,6 @@ def main():
         batt_st = batt_state(batt)
         temp_st = temp_state(temp)
 
-        # Correct Firebase message based on new temp_state logic
         if temp_st == "temp_safe":
             temp_status = "Temperature is Safe"
         elif temp_st == "temp_high":
