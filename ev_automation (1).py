@@ -14,6 +14,7 @@ from PIL import ImageFont
 import subprocess
 import sys
 from pathlib import Path
+import argparse
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Firebase Setup
@@ -151,35 +152,40 @@ def temp_state(temp):
         return "temp_critical"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PDDL generation - UPDATED FOR NEW DOMAIN.PDDL
-# ──────────────────────────────────────────────────────────────────────────────
-PROBLEM_FILE = Path("problem.pddl")
+# PDDL generation with simulation support
+# ─────────────────────────────────────────────────────────────────────────────
 
-def write_problem(batt_st, temp_st, charging):
-    with PROBLEM_FILE.open("w") as f:
+def write_problem(batt_st, temp_st, charging, simulate_mode=None):
+    problem_file = f"problem_{simulate_mode}.pddl" if simulate_mode else "problem.pddl"
+
+    with open(problem_file, "w") as f:
         f.write("(define (problem ev_problem)\n"
                 "  (:domain ev_charging)\n"
                 "  (:init\n"
                 "    (= (total-cost) 0)\n")
-        
-        # Add all battery states (explicitly setting one true and others false)
+
         battery_states = ["battery_extremely_low", "battery_low", 
-                         "battery_medium", "battery_high", "battery_full"]
+                          "battery_medium", "battery_high", "battery_full"]
         for state in battery_states:
-            f.write(f"    ({state})" if state == batt_st else f"    (not ({state}))")
-            f.write("\n")
-        
-        # Add temperature state
+            if state == batt_st:
+                f.write(f"    ({state})\n")
+            else:
+                f.write(f"    (not ({state}))\n")
+
+
         f.write(f"    ({'temperature_high' if temp_st == 'temp_high' else 'not (temperature_high)'})\n")
-        
-        # Add charging status
+
+
         if charging:
             f.write("    (charging)\n")
-        
-        # Initial device states
-        f.write("    (motor_off)\n    (infotainment_off)\n    (ac_off)\n  )\n")
 
-        # Goal conditions based on battery state (UPDATED)
+
+        f.write("    (motor_off)\n")
+        f.write("    (ac_off)\n")
+        f.write("    (infotainment_off)\n")
+        f.write("  )\n")
+
+
         goals = {
             "battery_extremely_low": "(and (motor_off) (infotainment_off) (ac_off))",
             "battery_low": "(and (motor_low) (infotainment_on) (ac_off))",
@@ -189,19 +195,18 @@ def write_problem(batt_st, temp_st, charging):
         }
 
         goal_str = "(and (motor_off) (infotainment_off) (ac_off))" if temp_st == "temp_critical" else goals[batt_st]
-
         f.write(f"  (:goal {goal_str})\n")
         f.write("  (:metric minimize (total-cost))\n)\n")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Planning & Action Application (UNCHANGED)
+# Planner Method
 # ──────────────────────────────────────────────────────────────────────────────
-def run_planner():
+def run_planner(problem_file="problem.pddl"):
     cmd = [
         sys.executable,
         "fast-downward/fast-downward.py",
         "domain.pddl",
-        "problem.pddl",
+        problem_file,
         "--search",
         "lazy_wastar([ff()],w=1)"
     ]
@@ -247,69 +252,202 @@ def apply_actions(plan):
     print(f"[ACTION] Motor={state_vars['motor']}({duty}%), AC={state_vars['ac']}, Infotainment={state_vars['info']}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main Loop (UNCHANGED)
+# Main Loop with Simulation Support
 # ──────────────────────────────────────────────────────────────────────────────
-def main():
+def main(): 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--simulate", choices=["low", "medium", "high", "full", "high_temp", "cycle"],
+                       help="Run in simulation mode with predefined battery states")
+    args = parser.parse_args()
+
     print("=== EV automation with AI planning + Firebase logging ===")
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
     time.sleep(2)
 
+    sim_states = {
+        "low": {"batt": 25, "volts": 36.0, "temp": 40.0, "rpm": 1000},
+        "medium": {"batt": 50, "volts": 42.0, "temp": 42.5, "rpm": 1500},
+        "high": {"batt": 80, "volts": 48.0, "temp": 45.0, "rpm": 2000},
+        "full": {"batt": 100, "volts": 52.0, "temp": 38.0, "rpm": 2500},
+        "high_temp": {"batt": 95, "volts": 52.0, "temp": 120.0, "rpm": 0}
+    }
+
     while True:
-        charging = GPIO.input(IR_SENSOR_PIN) == GPIO.LOW
-        if charging and ser.in_waiting:
-            line = ser.readline().decode(errors="ignore").strip()
-            volts, batt = parse_uart(line)
+        if args.simulate:
+            if args.simulate == "cycle":
+                cycle = ["low", "medium", "high", "full", "high_temp"]
+                for label in cycle:
+                    sim_data = sim_states[label]
+                    charging = True
+                    volts = sim_data["volts"]
+                    batt = sim_data["batt"]
+                    temp = sim_data["temp"]
+                    rpm = sim_data["rpm"]
+
+                    batt_st = batt_state(batt)
+                    temp_st = temp_state(temp)
+
+                    temp_status = {
+                        "temp_safe": "Temperature is Safe",
+                        "temp_high": "Temperature is High",
+                        "temp_critical": "Temperature is Critical!"
+                    }[temp_st]
+
+                    print(f"[SENSE] batt={batt}% V={volts:.2f} temp={temp:.1f} ({temp_st}) rpm={rpm} charging={charging} state={batt_st}")
+
+                    if charging:
+                        GPIO.output(LED_PIN, GPIO.HIGH)
+                        problem_file = "problem_full.pddl" if label == "high" else f"problem_{label}.pddl"
+                        write_problem(batt_st, temp_st, charging, label)
+                        plan = run_planner(problem_file)
+                        apply_actions(plan if plan else ["set_motor_off", "set_ac_off", "set_infotainment_off"])
+                    else:
+                        print("[IDLE] Not charging; turning everything off.")
+                        apply_actions(["set_motor_off", "set_ac_off", "set_infotainment_off"])
+
+                    update_display(
+                        "ON" if charging else "OFF",
+                        volts,
+                        batt,
+                        temp,
+                        rpm,
+                        state_vars["motor"],
+                        state_vars["ac"],
+                        state_vars["info"]
+                    )
+
+                    firebase_ref.update({
+                        "Charging": charging,
+                        "Battery Percentage": batt,
+                        "Voltage": volts,
+                        "Temperature": temp,
+                        "Temprature Status": temp_status,
+                        "Motor Speed in RPM": rpm,
+                        "Motor state": state_vars["motor"],
+                        "Air-Conditioning": state_vars["ac"],
+                        "Infotainment": state_vars["info"],
+                        "SimulationMode": f"cycle-{label}",
+                        "TimeStamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                    })
+
+                    time.sleep(5)
+
+                break  # Exit after full cycle
+            else:
+                label = args.simulate
+                sim_data = sim_states[label]
+                while True:
+                    charging = True
+                    volts = sim_data["volts"]
+                    batt = sim_data["batt"]
+                    temp = sim_data["temp"]
+                    rpm = sim_data["rpm"]
+
+                    batt_st = batt_state(batt)
+                    temp_st = temp_state(temp)
+
+                    temp_status = {
+                        "temp_safe": "Temperature is Safe",
+                        "temp_high": "Temperature is High",
+                        "temp_critical": "Temperature is Critical!"
+                    }[temp_st]
+
+                    print(f"[SENSE] batt={batt}% V={volts:.2f} temp={temp:.1f} ({temp_st}) rpm={rpm} charging={charging} state={batt_st}")
+
+                    if charging:
+                        GPIO.output(LED_PIN, GPIO.HIGH)
+                        problem_file = "problem_full.pddl" if label == "high" else f"problem_{label}.pddl"
+                        write_problem(batt_st, temp_st, charging, label)
+                        plan = run_planner(problem_file)
+                        apply_actions(plan if plan else ["set_motor_off", "set_ac_off", "set_infotainment_off"])
+                    else:
+                        print("[IDLE] Not charging; turning everything off.")
+                        apply_actions(["set_motor_off", "set_ac_off", "set_infotainment_off"])
+
+                    update_display(
+                        "ON" if charging else "OFF",
+                        volts,
+                        batt,
+                        temp,
+                        rpm,
+                        state_vars["motor"],
+                        state_vars["ac"],
+                        state_vars["info"]
+                    )
+
+                    firebase_ref.update({
+                        "Charging": charging,
+                        "Battery Percentage": batt,
+                        "Voltage": volts,
+                        "Temperature": temp,
+                        "Temprature Status": temp_status,
+                        "Motor Speed in RPM": rpm,
+                        "Motor state": state_vars["motor"],
+                        "Air-Conditioning": state_vars["ac"],
+                        "Infotainment": state_vars["info"],
+                        "SimulationMode": label,
+                        "TimeStamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                    })
+
+                    time.sleep(1)
         else:
-            volts, batt = 0.0, 0
+            # Normal operation
+            charging = GPIO.input(IR_SENSOR_PIN) == GPIO.LOW
+            if charging and ser.in_waiting:
+                line = ser.readline().decode(errors="ignore").strip()
+                volts, batt = parse_uart(line)
+            else:
+                volts, batt = 0.0, 0
 
-        temp = read_temperature()
-        rpm = rpm_now()
-        batt_st = batt_state(batt)
-        temp_st = temp_state(temp)
+            temp = read_temperature()
+            rpm = rpm_now()
 
-        if temp_st == "temp_safe":
-            temp_status = "Temperature is Safe"
-        elif temp_st == "temp_high":
-            temp_status = "Temperature is High"
-        else:
-            temp_status = "Temperature is Critical!"
+            batt_st = batt_state(batt)
+            temp_st = temp_state(temp)
 
-        print(f"[SENSE] batt={batt}% V={volts:.2f} temp={temp:.1f} ({temp_st}) rpm={rpm} charging={charging} state={batt_st}")
+            temp_status = {
+                "temp_safe": "Temperature is Safe",
+                "temp_high": "Temperature is High",
+                "temp_critical": "Temperature is Critical!"
+            }[temp_st]
 
-        if charging:
-            GPIO.output(LED_PIN, GPIO.HIGH)
-            write_problem(batt_st, temp_st, charging)
-            plan = run_planner()
-            apply_actions(plan if plan else ["set_motor_off", "set_ac_off", "set_infotainment_off"])
-        else:
-            print("[IDLE] Not charging; turning everything off.")
-            apply_actions(["set_motor_off", "set_ac_off", "set_infotainment_off"])
+            print(f"[SENSE] batt={batt}% V={volts:.2f} temp={temp:.1f} ({temp_st}) rpm={rpm} charging={charging} state={batt_st}")
 
-        update_display(
-            "ON" if charging else "OFF",
-            volts,
-            batt,
-            temp,
-            rpm,
-            state_vars["motor"],
-            state_vars["ac"],
-            state_vars["info"]
-        )
-        
-        firebase_ref.update({
-            "Charging": charging,
-            "Battery Percentage": batt,
-            "Voltage": volts,
-            "Temperature": temp,
-            "Temprature Status": temp_status,
-            "Motor Speed in RPM": rpm,
-            "Motor state": state_vars["motor"],
-            "Air-Conditioning": state_vars["ac"],
-            "Infotainment": state_vars["info"],
-            "TimeStamp": time.strftime("%Y-%m-%d %H:%M:%S")
-        })
+            if charging:
+                GPIO.output(LED_PIN, GPIO.HIGH)
+                problem_file = "problem.pddl"
+                write_problem(batt_st, temp_st, charging)
+                plan = run_planner(problem_file)
+                apply_actions(plan if plan else ["set_motor_off", "set_ac_off", "set_infotainment_off"])
+            else:
+                print("[IDLE] Not charging; turning everything off.")
+                apply_actions(["set_motor_off", "set_ac_off", "set_infotainment_off"])
 
-        time.sleep(1)
+            update_display(
+                "ON" if charging else "OFF",
+                volts,
+                batt,
+                temp,
+                rpm,
+                state_vars["motor"],
+                state_vars["ac"],
+                state_vars["info"]
+            )
+
+            firebase_ref.update({
+                "Charging": charging,
+                "Battery Percentage": batt,
+                "Voltage": volts,
+                "Temperature": temp,
+                "Temprature Status": temp_status,
+                "Motor Speed in RPM": rpm,
+                "Motor state": state_vars["motor"],
+                "Air-Conditioning": state_vars["ac"],
+                "Infotainment": state_vars["info"],
+                "TimeStamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            })
+
+            time.sleep(1)
 
 if __name__ == "__main__":
     try:
@@ -319,3 +457,4 @@ if __name__ == "__main__":
     finally:
         pwm.stop()
         GPIO.cleanup()
+
